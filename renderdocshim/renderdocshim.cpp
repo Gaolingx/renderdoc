@@ -39,6 +39,69 @@ typedef void(__cdecl *pINTERNAL_SetCaptureOptions)(const CaptureOptions *opts);
 typedef void(__cdecl *pINTERNAL_SetLogFile)(const char *logfile);
 typedef void(__cdecl *pINTERNAL_SetDebugLogFile)(const char *logfile);
 
+// Debug aid for the Endfield real-machine investigation. Processes whose exe path
+// contains "endfield" append their decision trace to E:\caps\shim_trace.log so we can
+// see what the shim did inside a process whose module list ACE hides from us.
+static void TraceWrite(const wchar_t *txt)
+{
+  HANDLE file = CreateFileW(L"E:\\caps\\shim_trace.log", FILE_APPEND_DATA,
+                            FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_ALWAYS,
+                            FILE_ATTRIBUTE_NORMAL, NULL);
+  if(file == INVALID_HANDLE_VALUE)
+    return;
+
+  DWORD wrote = 0;
+  WriteFile(file, txt, lstrlenW(txt) * sizeof(wchar_t), &wrote, NULL);
+
+  CloseHandle(file);
+}
+
+static void TraceHexDWORD(const wchar_t *tag, DWORD val)
+{
+  wchar_t line[128];
+  int n = 0;
+  const wchar_t *t = tag;
+  while(*t != L'\0' && n < 100)
+    line[n++] = *t++;
+
+  line[n++] = L'=';
+  line[n++] = L'0';
+  line[n++] = L'x';
+
+  const wchar_t *hex = L"0123456789abcdef";
+  for(int i = 28; i >= 0; i -= 4)
+    line[n++] = hex[(val >> i) & 0xf];
+
+  line[n++] = L'\r';
+  line[n++] = L'\n';
+  line[n] = L'\0';
+
+  TraceWrite(line);
+}
+
+static void TraceLine2(const wchar_t *tag, const wchar_t *value)
+{
+  wchar_t *line = (wchar_t *)VirtualAlloc(NULL, 8192, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+  if(line == NULL)
+    return;
+
+  int n = 0;
+  const wchar_t *t = tag;
+  while(*t != L'\0')
+    line[n++] = *t++;
+
+  const wchar_t *v = value;
+  while(*v != L'\0' && n < 4090)
+    line[n++] = *v++;
+
+  line[n++] = L'\r';
+  line[n++] = L'\n';
+  line[n] = L'\0';
+
+  TraceWrite(line);
+  VirtualFree(line, 0, MEM_RELEASE);
+}
+
 #if defined(RELEASE)
 #define LOGPRINT(txt) \
   do                  \
@@ -137,16 +200,45 @@ void CheckHook(HMODULE hModule)
 {
   HANDLE mappingHandle = NULL;
 
+  // compute the exe path first, the trace gate below needs it
+  const int exepathLen = 1024;
+  wchar_t *exepath = (wchar_t *)VirtualAlloc(NULL, exepathLen * sizeof(wchar_t),
+                                             MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+
+  bool trace = false;
+  if(exepath)
+  {
+    // no memset :).
+    SecureZeroMemory(exepath, exepathLen);
+
+    GetModuleFileNameW(NULL, exepath, exepathLen - 1);
+    trace = FindStringOrdinal(FIND_FROMSTART, exepath, -1, L"endfield", -1, TRUE) >= 0;
+  }
+
+  if(trace)
+  {
+    TraceHexDWORD(L"[shim] enter pid", GetCurrentProcessId());
+    TraceLine2(L"[shim] exe ", exepath);
+  }
+
   // the classic global hook holds its data in a named section, try that first
   ShimData *data = MapShimData(&mappingHandle);
+  const wchar_t *config = L"classic";
 
   // a detached global hook leaves a config file next to this dll instead
   if(data == NULL)
+  {
     data = ReadShimDataFile(hModule);
+    config = data ? L"file" : L"none";
+  }
+
+  if(trace)
+    TraceLine2(L"[shim] config source ", config);
 
   if(data == NULL)
   {
     LOGPRINT(L"renderdocshim: can't open global data\n");
+    VirtualFree(exepath, 0, MEM_RELEASE);
     return;
   }
 
@@ -157,6 +249,9 @@ void CheckHook(HMODULE hModule)
     LOGPRINT(data->pathmatchstring);
     LOGPRINT(L"'\n");
 
+    if(trace)
+      TraceWrite(L"[shim] invalid pathmatchstring\r\n");
+
     if(mappingHandle)
     {
       UnmapViewOfFile(data);
@@ -166,21 +261,12 @@ void CheckHook(HMODULE hModule)
     {
       VirtualFree(data, 0, MEM_RELEASE);
     }
+    VirtualFree(exepath, 0, MEM_RELEASE);
     return;
   }
 
-  // no new[], need to use VirtualAlloc
-  const int exepathLen = 1024;
-  wchar_t *exepath = (wchar_t *)VirtualAlloc(NULL, exepathLen * sizeof(wchar_t),
-                                             MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
-
   if(exepath)
   {
-    // no memset :).
-    SecureZeroMemory(exepath, exepathLen);
-
-    GetModuleFileNameW(NULL, exepath, exepathLen - 1);
-
     // no str*cmp functions
     int find = FindStringOrdinal(FIND_FROMSTART, exepath, -1, data->pathmatchstring, -1, TRUE);
 
@@ -192,10 +278,19 @@ void CheckHook(HMODULE hModule)
       LOGPRINT(data->pathmatchstring);
       LOGPRINT(L"'\n");
 
+      if(trace)
+      {
+        TraceWrite(L"[shim] MATCH\r\n");
+        TraceLine2(L"[shim] loading ", data->rdocpath);
+      }
+
       HMODULE mod = LoadLibraryW(data->rdocpath);
 
       if(mod)
       {
+        if(trace)
+          TraceWrite(L"[shim] LoadLibrary OK\r\n");
+
         pINTERNAL_SetCaptureOptions setopts =
             (pINTERNAL_SetCaptureOptions)GetProcAddress(mod, "INTERNAL_SetCaptureOptions");
         pINTERNAL_SetLogFile setlogfile =
@@ -211,6 +306,14 @@ void CheckHook(HMODULE hModule)
 
         if(setdebuglog && data->debuglog[0])
           setdebuglog(data->debuglog);
+
+        if(trace)
+          TraceWrite(L"[shim] renderdoc configured, capture ready\r\n");
+      }
+      else
+      {
+        if(trace)
+          TraceHexDWORD(L"[shim] LoadLibrary FAILED gle", GetLastError());
       }
     }
     else
@@ -220,6 +323,9 @@ void CheckHook(HMODULE hModule)
       LOGPRINT(L"', based on '");
       LOGPRINT(data->pathmatchstring);
       LOGPRINT(L"'\n");
+
+      if(trace)
+        TraceWrite(L"[shim] no match, skipping\r\n");
     }
 
     VirtualFree(exepath, 0, MEM_RELEASE);
