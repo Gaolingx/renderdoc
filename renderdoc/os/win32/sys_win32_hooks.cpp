@@ -324,6 +324,38 @@ private:
     return ret;
   }
 
+  static bool ChildMatchFilter(LPCWSTR lpApplicationName, LPCWSTR lpCommandLine)
+  {
+    char match[1024] = {};
+    DWORD len = GetEnvironmentVariableA("RENDERDOC_CHILD_MATCH", match, sizeof(match));
+    if(len == 0 || len >= sizeof(match))
+      return true;
+
+    rdcstr app, cmd;
+    if(lpApplicationName)
+      app = strlower(StringFormat::Wide2UTF8(lpApplicationName));
+    if(lpCommandLine)
+      cmd = strlower(StringFormat::Wide2UTF8(lpCommandLine));
+
+    rdcstr filter = strlower(rdcstr(match, len));
+    size_t start = 0;
+    while(start <= filter.size())
+    {
+      int32_t found = filter.find(';', (int32_t)start);
+      size_t end = found < 0 ? filter.size() : (size_t)found;
+
+      rdcstr token = filter.substr(start, end - start);
+      if(!token.empty() && (app.contains(token) || cmd.contains(token)))
+        return true;
+
+      if(end == filter.size())
+        break;
+      start = end + 1;
+    }
+
+    return false;
+  }
+
   static bool ShouldInject(LPCWSTR lpApplicationName, LPCWSTR lpCommandLine)
   {
     if(!RenderDoc::Inst().GetCaptureOptions().hookIntoChildren)
@@ -351,6 +383,9 @@ private:
         inject = false;
       }
     }
+
+    if(inject && !ChildMatchFilter(lpApplicationName, lpCommandLine))
+      inject = false;
 
     return inject;
   }

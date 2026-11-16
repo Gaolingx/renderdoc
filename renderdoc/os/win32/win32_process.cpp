@@ -33,6 +33,7 @@
 #include "core/core.h"
 #include "os/os_specific.h"
 #include "strings/string_utils.h"
+#include "../renderdocshim/renderdocshim.h"
 
 #include <string>
 
@@ -1213,6 +1214,10 @@ struct GlobalHookData
     rdcwstr appinitDLLs;
   } dataNative, dataWow32;
 
+  bool usedWow32 = false;
+  bool hadRequireSigned = false;
+  DWORD requireSigned = 0;
+
   int32_t finished = 0;
   Threading::ThreadHandle pipeThread = 0;
 };
@@ -1238,6 +1243,8 @@ static RDResult HandleRegError(HKEY keyNative, HKEY keyWow32, LSTATUS ret, const
   {                                                       \
     return HandleRegError(keyNative, keyWow32, ret, msg); \
   }
+
+void RestoreRegistry(const GlobalHookData &hookdata);
 
 // function to backup the previous settings for AppInit, then enable it and write our own paths.
 RDResult BackupAndChangeRegistry(GlobalHookData &hookdata, const rdcstr &shimpathWow32,
@@ -1299,6 +1306,16 @@ RDResult BackupAndChangeRegistry(GlobalHookData &hookdata, const rdcstr &shimpat
                      (void *)&hookdata.dataNative.appinitEnabled, &sz);
   REG_CHECK("Could not fetch LoadAppInit_DLLs");
 
+  // the shim is not signed, so if the system requires signed AppInit DLLs it will silently be
+  // ignored. Back up the value and disable the requirement while the hook is active.
+  sz = sizeof(DWORD);
+  ret = RegGetValueA(keyNative, NULL, "RequireSignedAppInit_DLLs", RRF_RT_REG_DWORD, NULL,
+                     (void *)&hookdata.requireSigned, &sz);
+  hookdata.hadRequireSigned = (ret == ERROR_SUCCESS);
+
+  if(hookdata.hadRequireSigned && hookdata.requireSigned != 0)
+    RDCLOG("Temporarily disabling the AppInit DLL signature requirement for the global hook");
+
   sz = 0;
   ret = RegGetValueW(keyNative, NULL, L"AppInit_DLLs", RRF_RT_ANY, NULL, NULL, &sz);
   if(ret == ERROR_MORE_DATA || ret == ERROR_SUCCESS)
@@ -1321,6 +1338,15 @@ RDResult BackupAndChangeRegistry(GlobalHookData &hookdata, const rdcstr &shimpat
                        DWORD(shortpath.length() * sizeof(wchar_t)));
   REG_CHECK("Could not set AppInit_DLLs");
 
+  const DWORD zero = 0;
+  ret = RegSetValueExA(keyNative, "RequireSignedAppInit_DLLs", 0, REG_DWORD,
+                       (const BYTE *)&zero, sizeof(zero));
+  if(ret != ERROR_SUCCESS)
+  {
+    RestoreRegistry(hookdata);
+    return HandleRegError(keyNative, keyWow32, ret, "Could not set RequireSignedAppInit_DLLs");
+  }
+
   // if we're doing Wow32, repeat the process for those keys
   if(keyWow32)
   {
@@ -1338,6 +1364,8 @@ RDResult BackupAndChangeRegistry(GlobalHookData &hookdata, const rdcstr &shimpat
                          hookdata.dataWow32.appinitDLLs.data(), &sz);
     }
     REG_CHECK("Could not fetch AppInit_DLLs");
+
+    hookdata.usedWow32 = true;
 
     ret = RegSetValueExA(keyWow32, "LoadAppInit_DLLs", 0, REG_DWORD, (const BYTE *)&one, sizeof(one));
     REG_CHECK("Could not set LoadAppInit_DLLs");
@@ -1364,6 +1392,11 @@ RDResult BackupAndChangeRegistry(GlobalHookData &hookdata, const rdcstr &shimpat
   // we append with the C string so we don't add trailing NULLs into the text.
   backup += hookdata.dataNative.appinitDLLs.c_str();
   backup += L"\"\n";
+  if(hookdata.hadRequireSigned)
+  {
+    backup += L"\"RequireSignedAppInit_DLLs\"=dword:0000000";
+    backup += (hookdata.requireSigned ? L"1\n" : L"0\n");
+  }
   if(keyWow32)
   {
     backup += L"\n";
@@ -1426,11 +1459,14 @@ void RestoreRegistry(const GlobalHookData &hookdata)
   REG_CHECK("Could not open AppInit key");
 
 #if ENABLED(RDOC_X64)
-  ret = RegCreateKeyExA(HKEY_LOCAL_MACHINE,
-                        "SOFTWARE\\Wow6432Node\\Microsoft\\Windows NT\\CurrentVersion\\Windows", 0,
-                        NULL, 0, KEY_READ | KEY_WRITE, NULL, &keyWow32, NULL);
+  if(hookdata.usedWow32)
+  {
+    ret = RegCreateKeyExA(HKEY_LOCAL_MACHINE,
+                          "SOFTWARE\\Wow6432Node\\Microsoft\\Windows NT\\CurrentVersion\\Windows",
+                          0, NULL, 0, KEY_READ | KEY_WRITE, NULL, &keyWow32, NULL);
 
-  REG_CHECK("Could not open AppInit key");
+    REG_CHECK("Could not open AppInit key");
+  }
 #endif
 
   // set the native values back to where they were
@@ -1443,6 +1479,17 @@ void RestoreRegistry(const GlobalHookData &hookdata)
                        (const BYTE *)hookdata.dataNative.appinitDLLs.c_str(),
                        DWORD(hookdata.dataNative.appinitDLLs.length() * sizeof(wchar_t)));
   REG_CHECK("Could not set AppInit_DLLs");
+
+  if(hookdata.hadRequireSigned)
+  {
+    ret = RegSetValueExA(keyNative, "RequireSignedAppInit_DLLs", 0, REG_DWORD,
+                         (const BYTE *)&hookdata.requireSigned, sizeof(DWORD));
+    REG_CHECK("Could not set RequireSignedAppInit_DLLs");
+  }
+  else
+  {
+    RegDeleteValueA(keyNative, "RequireSignedAppInit_DLLs");
+  }
 
   // if we opened it, restore the Wow32 values as well
   if(keyWow32)
@@ -1555,6 +1602,19 @@ RDResult Process::StartGlobalHook(const rdcstr &pathmatch, const rdcstr &capture
 
 #endif
 
+  if(!shimpathWow32.empty() && !cmdpathWow32.empty())
+  {
+    rdcwstr wshimWow32 = StringFormat::UTF82Wide(shimpathWow32);
+    rdcwstr wcmdWow32 = StringFormat::UTF82Wide(cmdpathWow32);
+
+    if(GetFileAttributesW(wshimWow32.c_str()) == INVALID_FILE_ATTRIBUTES ||
+       GetFileAttributesW(wcmdWow32.c_str()) == INVALID_FILE_ATTRIBUTES)
+    {
+      shimpathWow32.clear();
+      cmdpathWow32.clear();
+    }
+  }
+
   GlobalHookData hookdata;
 
   // try to backup and change the registry settings to start loading our shim dlls. If that fails,
@@ -1650,6 +1710,8 @@ RDResult Process::StartGlobalHook(const rdcstr &pathmatch, const rdcstr &capture
 
 // repeat the process for the Wow32 renderdoccmd
 #if ENABLED(RDOC_X64)
+  if(!cmdpathWow32.empty())
+  {
   params = StringFormat::Fmt(
       "\"%s\" globalhook --match \"%s\" --capfile \"%s\" --debuglog \"%s\" --capopts \"%s\"",
       cmdpathWow32.c_str(), pathmatch.c_str(), capturefile.c_str(), debugLogfile.c_str(),
@@ -1706,7 +1768,23 @@ RDResult Process::StartGlobalHook(const rdcstr &pathmatch, const rdcstr &capture
 
   CloseHandle(pi.hThread);
   CloseHandle(pi.hProcess);
+  }
 #endif
+
+  // the globalhook child processes create the shared memory that the shims read. Wait until it
+  // exists so that a process launched immediately after this call still gets hooked.
+  for(int i = 0; i < 200; i++)
+  {
+    HANDLE mapping = OpenFileMappingA(FILE_MAP_READ, FALSE, GLOBAL_HOOK_DATA_NAME);
+
+    if(mapping)
+    {
+      CloseHandle(mapping);
+      break;
+    }
+
+    Threading::Sleep(10);
+  }
 
   // set static global pointer with our data, and launch the thread
   globalHook = new GlobalHookData;

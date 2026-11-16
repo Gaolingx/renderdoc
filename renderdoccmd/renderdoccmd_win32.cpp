@@ -29,6 +29,7 @@
 #include <windows.h>
 #include <string>
 #include <vector>
+#include <cwctype>
 #include "miniz/miniz.h"
 #include "resource.h"
 
@@ -892,6 +893,266 @@ public:
   }
 };
 
+struct StartGlobalHookCommand : public Command
+{
+private:
+  std::string match;
+  std::string launch;
+  std::string launchArgs;
+  std::string captureFile;
+  std::string workingDir;
+  std::string childMatch;
+  int timeoutSec = 300;
+
+  static std::wstring Lower(std::wstring str)
+  {
+    for(wchar_t &c : str)
+      c = (wchar_t)towlower(c);
+    return str;
+  }
+
+  static bool FindProcess(const std::wstring &match, DWORD &pid, std::wstring &path)
+  {
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if(snap == INVALID_HANDLE_VALUE)
+      return false;
+
+    const std::wstring lowerMatch = Lower(match);
+    PROCESSENTRY32W entry = {};
+    entry.dwSize = sizeof(entry);
+
+    bool found = false;
+    if(Process32FirstW(snap, &entry))
+    {
+      do
+      {
+        if(entry.th32ProcessID == GetCurrentProcessId())
+          continue;
+
+        std::wstring fullpath;
+        HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, entry.th32ProcessID);
+        if(process)
+        {
+          wchar_t buffer[2048] = {};
+          DWORD len = 2048;
+          if(QueryFullProcessImageNameW(process, 0, buffer, &len))
+            fullpath.assign(buffer, len);
+          CloseHandle(process);
+        }
+
+        if(fullpath.empty())
+          fullpath = entry.szExeFile;
+
+        if(Lower(fullpath).find(lowerMatch) != std::wstring::npos)
+        {
+          pid = entry.th32ProcessID;
+          path = fullpath;
+          found = true;
+          break;
+        }
+      } while(Process32NextW(snap, &entry));
+    }
+
+    CloseHandle(snap);
+    return found;
+  }
+
+  static bool ProcessAlive(DWORD pid)
+  {
+    HANDLE process = OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if(process)
+    {
+      DWORD result = WaitForSingleObject(process, 0);
+      CloseHandle(process);
+      return result == WAIT_TIMEOUT;
+    }
+
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if(snap == INVALID_HANDLE_VALUE)
+      return false;
+
+    PROCESSENTRY32W entry = {};
+    entry.dwSize = sizeof(entry);
+    bool alive = false;
+    if(Process32FirstW(snap, &entry))
+    {
+      do
+      {
+        if(entry.th32ProcessID == pid)
+        {
+          alive = true;
+          break;
+        }
+      } while(Process32NextW(snap, &entry));
+    }
+    CloseHandle(snap);
+    return alive;
+  }
+
+  static volatile LONG hookActive;
+  static BOOL WINAPI CtrlHandler(DWORD)
+  {
+    if(InterlockedCompareExchange(&hookActive, 0, 1) == 1)
+      RENDERDOC_StopGlobalHook();
+    return FALSE;
+  }
+
+  void StopHook()
+  {
+    if(InterlockedCompareExchange(&hookActive, 0, 1) == 1)
+      RENDERDOC_StopGlobalHook();
+    SetConsoleCtrlHandler(CtrlHandler, FALSE);
+  }
+
+public:
+  virtual void AddOptions(cmdline::parser &parser)
+  {
+    parser.add<std::string>("match", 0, "Substring of the target executable path to hook.", true);
+    parser.add<std::string>("launch", 0, "Optional program to launch after the hook is active.",
+                            false);
+    parser.add<std::string>("args", 0, "Command line arguments for --launch.", false);
+    parser.add<std::string>("child-match", 0,
+                            "Semicolon-separated substrings. Only hook child processes whose "
+                            "path or command line contains one of them.",
+                            false);
+    parser.add<int>("timeout", 0, "Seconds to wait for the target process.", false, 300,
+                    cmdline::range(1, 86400));
+  }
+  virtual const char *Description()
+  {
+    return "Starts the global process hook and waits for a matching process.";
+  }
+  virtual bool IsInternalOnly() { return false; }
+  virtual bool IsCaptureCommand() { return true; }
+  virtual bool Parse(cmdline::parser &parser, GlobalEnvironment &)
+  {
+    match = parser.get<std::string>("match");
+    launch = parser.get<std::string>("launch");
+    launchArgs = parser.get<std::string>("args");
+    captureFile = parser.get<std::string>("capture-file");
+    workingDir = parser.get<std::string>("working-dir");
+    childMatch = parser.get<std::string>("child-match");
+    timeoutSec = parser.get<int>("timeout");
+    return true;
+  }
+  virtual int Execute(const CaptureOptions &opts)
+  {
+    if(match.size() < 4)
+    {
+      std::cerr << "Global hook match string is too short/general." << std::endl;
+      return 1;
+    }
+
+    if(RENDERDOC_IsGlobalHookActive())
+    {
+      std::cerr << "A global hook is already active." << std::endl;
+      return 1;
+    }
+
+    if(captureFile.empty())
+    {
+      wchar_t temp[MAX_PATH] = {};
+      GetTempPathW(MAX_PATH, temp);
+      captureFile = conv(std::wstring(temp) + L"RenderDocGlobalHook");
+    }
+
+    std::string debugLog = captureFile + ".rdoc.log";
+    RENDERDOC_SetDebugLogFile(rdcstr(debugLog.c_str(), debugLog.size()));
+
+    std::wstring wmatch = conv(match);
+    DWORD existingPid = 0;
+    std::wstring existingPath;
+    if(FindProcess(wmatch, existingPid, existingPath))
+    {
+      std::cerr << "Target is already running (pid " << existingPid
+                << "). Close it before starting the global hook." << std::endl;
+      return 1;
+    }
+
+    ResultDetails result =
+        RENDERDOC_StartGlobalHook(rdcstr(match.c_str(), match.size()),
+                                  rdcstr(captureFile.c_str(), captureFile.size()), opts);
+
+    if(!result.OK())
+    {
+      std::cerr << "Failed to start global hook: " << result.Message().c_str() << std::endl;
+      return 1;
+    }
+
+    hookActive = 1;
+    SetConsoleCtrlHandler(CtrlHandler, TRUE);
+
+    std::cout << "Global hook active for '" << match << "'." << std::endl;
+    std::cout << "Capture template: " << captureFile << std::endl;
+    std::cout << "Debug log: " << debugLog << std::endl;
+    std::cout << "Press F12 or PrintScreen in the target process to capture." << std::endl;
+
+    if(!childMatch.empty())
+      SetEnvironmentVariableA("RENDERDOC_CHILD_MATCH", childMatch.c_str());
+
+    if(!launch.empty())
+    {
+      std::wstring wlaunch = conv(launch);
+      std::wstring wargs = conv(launchArgs);
+      std::wstring cmd = L"\"" + wlaunch + L"\"";
+      if(!wargs.empty())
+        cmd += L" " + wargs;
+
+      std::wstring wdir;
+      if(!workingDir.empty())
+        wdir = conv(workingDir);
+      else
+      {
+        wdir = wlaunch;
+        size_t slash = wdir.find_last_of(L"\\/");
+        if(slash != std::wstring::npos)
+          wdir = wdir.substr(0, slash);
+      }
+
+      STARTUPINFOW si = {};
+      si.cb = sizeof(si);
+      PROCESS_INFORMATION pi = {};
+      if(!CreateProcessW(NULL, &cmd[0], NULL, NULL, FALSE, 0, NULL,
+                         wdir.empty() ? NULL : wdir.c_str(), &si, &pi))
+      {
+        std::cerr << "Failed to launch '" << launch << "': " << GetLastError() << std::endl;
+        StopHook();
+        return 1;
+      }
+      CloseHandle(pi.hThread);
+      CloseHandle(pi.hProcess);
+    }
+
+    std::cout << "Waiting for target process..." << std::endl;
+
+    DWORD pid = 0;
+    std::wstring path;
+    ULONGLONG start = GetTickCount64();
+    while(!FindProcess(wmatch, pid, path))
+    {
+      if(GetTickCount64() - start > (ULONGLONG)timeoutSec * 1000ULL)
+      {
+        std::cerr << "Timed out waiting for the target process." << std::endl;
+        StopHook();
+        return 1;
+      }
+      Sleep(500);
+    }
+
+    std::cout << "Found target pid " << pid << " (" << conv(path) << ")." << std::endl;
+    std::cout << "Waiting for it to exit..." << std::endl;
+
+    while(ProcessAlive(pid))
+      Sleep(500);
+
+    std::cout << "Target exited. Stopping global hook." << std::endl;
+    StopHook();
+    return 0;
+  }
+};
+
+volatile LONG StartGlobalHookCommand::hookActive = 0;
+
 // ignore the argc/argv we get here, convert from wide to be sure we're unicode safe.
 int main(int, char *)
 {
@@ -946,6 +1207,8 @@ int main(int, char *)
   // processes and loads renderdoc.dll in the target one. In any other process it unloads as soon as
   // possible
   add_command("globalhook", new GlobalHookCommand());
+
+  add_command("startglobalhook", new StartGlobalHookCommand());
 
   return renderdoccmd(env, argv);
 }
