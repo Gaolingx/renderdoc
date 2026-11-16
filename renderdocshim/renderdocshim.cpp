@@ -53,24 +53,100 @@ typedef void(__cdecl *pINTERNAL_SetDebugLogFile)(const char *logfile);
   } while(0)
 #endif
 
-void CheckHook()
+static ShimData *MapShimData(HANDLE *mappingHandle)
 {
-  ShimData *data = NULL;
-
   HANDLE datahandle = OpenFileMappingA(FILE_MAP_READ, FALSE, GLOBAL_HOOK_DATA_NAME);
 
   if(datahandle == NULL)
-  {
-    LOGPRINT(L"renderdocshim: can't open global data\n");
-    return;
-  }
+    return NULL;
 
-  data = (ShimData *)MapViewOfFile(datahandle, FILE_MAP_READ, 0, 0, sizeof(ShimData));
+  ShimData *data = (ShimData *)MapViewOfFile(datahandle, FILE_MAP_READ, 0, 0, sizeof(ShimData));
 
   if(data == NULL)
   {
     CloseHandle(datahandle);
-    LOGPRINT(L"renderdocshim: can't map global data\n");
+    return NULL;
+  }
+
+  *mappingHandle = datahandle;
+  return data;
+}
+
+static ShimData *ReadShimDataFile(HMODULE hModule)
+{
+  // no CRT: the path buffer has to be heap-allocated, a large stack array would pull __chkstk in
+  wchar_t *cfgpath =
+      (wchar_t *)VirtualAlloc(NULL, 8192, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+  if(cfgpath == NULL)
+    return NULL;
+
+  DWORD len = GetModuleFileNameW(hModule, cfgpath, 4095);
+  if(len == 0 || len >= 4095)
+  {
+    VirtualFree(cfgpath, 0, MEM_RELEASE);
+    return NULL;
+  }
+
+  // find the last slash so we can replace the dll name with the config file name
+  wchar_t *lastSlash = cfgpath;
+  for(wchar_t *p = cfgpath; *p != L'\0'; p++)
+  {
+    if(*p == L'\\')
+      lastSlash = p + 1;
+  }
+
+  // no str*cpy functions, use the kernel32 ones
+  if(lastSlash + lstrlenW(GLOBAL_HOOK_FILE_NAME_W) + 1 >= cfgpath + 4095)
+  {
+    VirtualFree(cfgpath, 0, MEM_RELEASE);
+    return NULL;
+  }
+  lstrcpyW(lastSlash, GLOBAL_HOOK_FILE_NAME_W);
+
+  HANDLE file = CreateFileW(cfgpath, GENERIC_READ,
+                            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
+                            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+  VirtualFree(cfgpath, 0, MEM_RELEASE);
+
+  if(file == INVALID_HANDLE_VALUE)
+    return NULL;
+
+  // no new[], need to use VirtualAlloc
+  ShimData *data = (ShimData *)VirtualAlloc(NULL, sizeof(ShimData), MEM_RESERVE | MEM_COMMIT,
+                                            PAGE_READWRITE);
+  if(data == NULL)
+  {
+    CloseHandle(file);
+    return NULL;
+  }
+
+  DWORD read = 0;
+  BOOL ok = ReadFile(file, data, sizeof(ShimData), &read, NULL);
+  CloseHandle(file);
+
+  if(!ok || read != sizeof(ShimData))
+  {
+    VirtualFree(data, 0, MEM_RELEASE);
+    return NULL;
+  }
+
+  return data;
+}
+
+void CheckHook(HMODULE hModule)
+{
+  HANDLE mappingHandle = NULL;
+
+  // the classic global hook holds its data in a named section, try that first
+  ShimData *data = MapShimData(&mappingHandle);
+
+  // a detached global hook leaves a config file next to this dll instead
+  if(data == NULL)
+    data = ReadShimDataFile(hModule);
+
+  if(data == NULL)
+  {
+    LOGPRINT(L"renderdocshim: can't open global data\n");
     return;
   }
 
@@ -81,8 +157,15 @@ void CheckHook()
     LOGPRINT(data->pathmatchstring);
     LOGPRINT(L"'\n");
 
-    UnmapViewOfFile(data);
-    CloseHandle(datahandle);
+    if(mappingHandle)
+    {
+      UnmapViewOfFile(data);
+      CloseHandle(mappingHandle);
+    }
+    else
+    {
+      VirtualFree(data, 0, MEM_RELEASE);
+    }
     return;
   }
 
@@ -146,13 +229,20 @@ void CheckHook()
     LOGPRINT(L"renderdocshim: Failed to allocate exepath\n");
   }
 
-  UnmapViewOfFile(data);
-  CloseHandle(datahandle);
+  if(mappingHandle)
+  {
+    UnmapViewOfFile(data);
+    CloseHandle(mappingHandle);
+  }
+  else
+  {
+    VirtualFree(data, 0, MEM_RELEASE);
+  }
 }
 
 DWORD WINAPI CheckHookThread(LPVOID param)
 {
-  CheckHook();
+  CheckHook((HMODULE)param);
 
   // this makes sure that we remove the reference to the shim dll and unload from
   // the target process. That minimises the impact of having the dll inserted into

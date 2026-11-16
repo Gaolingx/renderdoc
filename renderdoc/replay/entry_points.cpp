@@ -398,6 +398,22 @@ extern "C" RENDERDOC_API bool RENDERDOC_CC RENDERDOC_CanGlobalHook()
   return Process::CanGlobalHook();
 }
 
+extern "C" RENDERDOC_API ResultDetails RENDERDOC_CC RENDERDOC_StartGlobalHookDetached(
+    const rdcstr &pathmatch, const rdcstr &capturefile, const CaptureOptions &opts)
+{
+  return Process::StartGlobalHookDetached(pathmatch, capturefile, opts);
+}
+
+extern "C" RENDERDOC_API ResultDetails RENDERDOC_CC RENDERDOC_StopGlobalHookDetached()
+{
+  return Process::StopGlobalHookDetached();
+}
+
+extern "C" RENDERDOC_API bool RENDERDOC_CC RENDERDOC_IsGlobalHookDetachedActive()
+{
+  return Process::IsGlobalHookDetachedActive();
+}
+
 extern "C" RENDERDOC_API ExecuteResult RENDERDOC_CC
 RENDERDOC_InjectIntoProcess(uint32_t pid, const rdcarray<EnvironmentModification> &env,
                             const rdcstr &capturefile, const CaptureOptions &opts, bool waitForExit)

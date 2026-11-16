@@ -2093,6 +2093,51 @@ DOCUMENT(R"(Determines if the global hook is supported on the current platform a
 )");
 extern "C" RENDERDOC_API bool RENDERDOC_CC RENDERDOC_CanGlobalHook();
 
+DOCUMENT(R"(Begin injecting speculatively into all new processes started on the system, without
+leaving any RenderDoc process running.
+
+Instead of spawning the helper processes that the classic :func:`StartGlobalHook` keeps alive to
+hold the configuration, the configuration is written to files next to the shim DLLs and this
+process exits as soon as the hook is installed. The hook must be closed with
+:func:`StopGlobalHookDetached`, which is typically done in a separate process after the target
+has exited.
+
+This function can only be called if global hooking is supported (see :func:`CanGlobalHook`) and if
+no other global hook is active (see :func:`IsGlobalHookActive` and
+:func:`IsGlobalHookDetachedActive`).
+
+This function must be called when the process is running with administrator/superuser permissions,
+and the directory containing the RenderDoc binaries must be writable since the configuration files
+are placed next to the shim DLLs.
+
+:param str pathmatch: A string to match against each new process's executable path to determine
+  which corresponds to the program we actually want to capture.
+:param str capturefile: Where to store any captures.
+:param CaptureOptions opts: The capture options to use when injecting into the program.
+:return: The result of the operation, if the result succeeded the hook is now active.
+:rtype: ResultDetails
+)");
+extern "C" RENDERDOC_API ResultDetails RENDERDOC_CC RENDERDOC_StartGlobalHookDetached(
+    const rdcstr &pathmatch, const rdcstr &capturefile, const CaptureOptions &opts);
+
+DOCUMENT(R"(Stop the detached global hook that was installed by :func:`StartGlobalHookDetached`,
+restoring the registry values that were backed up and deleting the configuration files.
+
+This function can be called from any process with administrator/superuser permissions, it does
+not need to be the same process that installed the hook.
+
+:return: The result of the operation.
+:rtype: ResultDetails
+)");
+extern "C" RENDERDOC_API ResultDetails RENDERDOC_CC RENDERDOC_StopGlobalHookDetached();
+
+DOCUMENT(R"(Determines if a detached global hook is installed but not yet stopped.
+
+:return: ``True`` if a detached hook is installed, or ``False`` if not.
+:rtype: bool
+)");
+extern "C" RENDERDOC_API bool RENDERDOC_CC RENDERDOC_IsGlobalHookDetachedActive();
+
 DOCUMENT(R"(Launch an application and inject into it to allow capturing.
 
 :param str app: The path to the application to run.

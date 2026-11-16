@@ -63,6 +63,10 @@ RDResult StartGlobalHook(const rdcstr &pathmatch, const rdcstr &capturefile,
                          const CaptureOptions &opts);
 bool IsGlobalHookActive();
 void StopGlobalHook();
+RDResult StartGlobalHookDetached(const rdcstr &pathmatch, const rdcstr &capturefile,
+                                 const CaptureOptions &opts);
+bool IsGlobalHookDetachedActive();
+RDResult StopGlobalHookDetached();
 
 rdcpair<RDResult, uint32_t> InjectIntoProcess(uint32_t pid,
                                               const rdcarray<EnvironmentModification> &env,

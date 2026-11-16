@@ -39,3 +39,8 @@ struct ShimData
 #define GLOBAL_HOOK_DATA_NAME "RenderDocGlobalHookData32"
 #define SHIM_DLL_NAME "renderdocshim32.dll"
 #endif
+
+// file next to each shim holding the ShimData when the hook is installed detached, in place of
+// the named section created by the classic globalhook child process
+#define GLOBAL_HOOK_FILE_NAME_A "RenderDocGlobalHookData.bin"
+#define GLOBAL_HOOK_FILE_NAME_W L"RenderDocGlobalHookData.bin"

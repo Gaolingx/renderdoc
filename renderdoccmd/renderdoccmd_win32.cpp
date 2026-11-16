@@ -903,6 +903,7 @@ private:
   std::string workingDir;
   std::string childMatch;
   int timeoutSec = 300;
+  bool detach = false;
 
   static std::wstring Lower(std::wstring str)
   {
@@ -1004,6 +1005,42 @@ private:
     SetConsoleCtrlHandler(CtrlHandler, FALSE);
   }
 
+  bool LaunchTarget()
+  {
+    if(launch.empty())
+      return true;
+
+    std::wstring wlaunch = conv(launch);
+    std::wstring wargs = conv(launchArgs);
+    std::wstring cmd = L"\"" + wlaunch + L"\"";
+    if(!wargs.empty())
+      cmd += L" " + wargs;
+
+    std::wstring wdir;
+    if(!workingDir.empty())
+      wdir = conv(workingDir);
+    else
+    {
+      wdir = wlaunch;
+      size_t slash = wdir.find_last_of(L"\\/");
+      if(slash != std::wstring::npos)
+        wdir = wdir.substr(0, slash);
+    }
+
+    STARTUPINFOW si = {};
+    si.cb = sizeof(si);
+    PROCESS_INFORMATION pi = {};
+    if(!CreateProcessW(NULL, &cmd[0], NULL, NULL, FALSE, 0, NULL,
+                       wdir.empty() ? NULL : wdir.c_str(), &si, &pi))
+    {
+      std::cerr << "Failed to launch '" << launch << "': " << GetLastError() << std::endl;
+      return false;
+    }
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    return true;
+  }
+
 public:
   virtual void AddOptions(cmdline::parser &parser)
   {
@@ -1017,6 +1054,9 @@ public:
                             false);
     parser.add<int>("timeout", 0, "Seconds to wait for the target process.", false, 300,
                     cmdline::range(1, 86400));
+    parser.add("detach", 0,
+               "Install the global hook and exit immediately, leaving no RenderDoc process "
+               "running. Stop it later with the stopglobalhook command.");
   }
   virtual const char *Description()
   {
@@ -1033,6 +1073,7 @@ public:
     workingDir = parser.get<std::string>("working-dir");
     childMatch = parser.get<std::string>("child-match");
     timeoutSec = parser.get<int>("timeout");
+    detach = parser.exist("detach");
     return true;
   }
   virtual int Execute(const CaptureOptions &opts)
@@ -1069,6 +1110,38 @@ public:
       return 1;
     }
 
+    if(detach)
+    {
+      ResultDetails result = RENDERDOC_StartGlobalHookDetached(
+          rdcstr(match.c_str(), match.size()), rdcstr(captureFile.c_str(), captureFile.size()),
+          opts);
+      if(!result.OK())
+      {
+        std::cerr << "Failed to start detached global hook: " << result.Message().c_str()
+                  << std::endl;
+        return 1;
+      }
+
+      std::cout << "Detached global hook installed for '" << match << "'." << std::endl;
+      std::cout << "No RenderDoc process stays running. Start the target and press F12 or "
+                   "PrintScreen in the target process to capture."
+                << std::endl;
+      std::cout << "Run renderdoccmd stopglobalhook as administrator when finished to stop the "
+                   "hook and restore settings."
+                << std::endl;
+
+      if(!childMatch.empty())
+        SetEnvironmentVariableA("RENDERDOC_CHILD_MATCH", childMatch.c_str());
+
+      if(!LaunchTarget())
+      {
+        RENDERDOC_StopGlobalHookDetached();
+        return 1;
+      }
+
+      return 0;
+    }
+
     ResultDetails result =
         RENDERDOC_StartGlobalHook(rdcstr(match.c_str(), match.size()),
                                   rdcstr(captureFile.c_str(), captureFile.size()), opts);
@@ -1090,37 +1163,10 @@ public:
     if(!childMatch.empty())
       SetEnvironmentVariableA("RENDERDOC_CHILD_MATCH", childMatch.c_str());
 
-    if(!launch.empty())
+    if(!LaunchTarget())
     {
-      std::wstring wlaunch = conv(launch);
-      std::wstring wargs = conv(launchArgs);
-      std::wstring cmd = L"\"" + wlaunch + L"\"";
-      if(!wargs.empty())
-        cmd += L" " + wargs;
-
-      std::wstring wdir;
-      if(!workingDir.empty())
-        wdir = conv(workingDir);
-      else
-      {
-        wdir = wlaunch;
-        size_t slash = wdir.find_last_of(L"\\/");
-        if(slash != std::wstring::npos)
-          wdir = wdir.substr(0, slash);
-      }
-
-      STARTUPINFOW si = {};
-      si.cb = sizeof(si);
-      PROCESS_INFORMATION pi = {};
-      if(!CreateProcessW(NULL, &cmd[0], NULL, NULL, FALSE, 0, NULL,
-                         wdir.empty() ? NULL : wdir.c_str(), &si, &pi))
-      {
-        std::cerr << "Failed to launch '" << launch << "': " << GetLastError() << std::endl;
-        StopHook();
-        return 1;
-      }
-      CloseHandle(pi.hThread);
-      CloseHandle(pi.hProcess);
+      StopHook();
+      return 1;
     }
 
     std::cout << "Waiting for target process..." << std::endl;
@@ -1152,6 +1198,32 @@ public:
 };
 
 volatile LONG StartGlobalHookCommand::hookActive = 0;
+
+struct StopGlobalHookCommand : public Command
+{
+public:
+  virtual void AddOptions(cmdline::parser &parser) {}
+  virtual const char *Description()
+  {
+    return "Stops a detached global hook and restores the previous settings.";
+  }
+  virtual bool IsInternalOnly() { return false; }
+  virtual bool IsCaptureCommand() { return false; }
+  virtual bool Parse(cmdline::parser &parser, GlobalEnvironment &) { return true; }
+  virtual int Execute(const CaptureOptions &)
+  {
+    ResultDetails result = RENDERDOC_StopGlobalHookDetached();
+    if(!result.OK())
+    {
+      std::cerr << "Failed to stop the detached global hook: " << result.Message().c_str()
+                << std::endl;
+      return 1;
+    }
+
+    std::cout << "Detached global hook stopped and settings restored." << std::endl;
+    return 0;
+  }
+};
 
 // ignore the argc/argv we get here, convert from wide to be sure we're unicode safe.
 int main(int, char *)
@@ -1209,6 +1281,8 @@ int main(int, char *)
   add_command("globalhook", new GlobalHookCommand());
 
   add_command("startglobalhook", new StartGlobalHookCommand());
+
+  add_command("stopglobalhook", new StopGlobalHookCommand());
 
   return renderdoccmd(env, argv);
 }
